@@ -266,6 +266,7 @@ namespace JSIL {
                 var assembliesToLoad = new List<AssemblyNameReference>();
                 var visitedModules = new HashSet<string>();
                 var assemblyNames = new HashSet<string>();
+                var alreadyLoadedNames = new HashSet<string>();
 
                 while ((modulesToVisit.Count > 0) || (assembliesToLoad.Count > 0)) {
                     foreach (var module in modulesToVisit) {
@@ -306,6 +307,15 @@ namespace JSIL {
                             );
 
                             if (refAssembly != null) {
+                                // We already visited it, perhaps under a different name (due to mscorlib versioning
+                                // stuff).  Note that we can't just hash Name directly, because it ends up being
+                                // different for some reason (at least, not equal, as far as HashSet is concerned).
+                                lock (alreadyLoadedNames) {
+                                    if (alreadyLoadedNames.Contains(refAssembly.Name.ToString()))
+                                        return;
+                                    alreadyLoadedNames.Add(refAssembly.Name.ToString());
+                                }
+
                                 if (AssemblyLoaded != null)
                                     AssemblyLoaded(refAssembly.MainModule.FullyQualifiedName);
 
