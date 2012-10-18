@@ -2114,6 +2114,279 @@ namespace JSIL {
             return null;
         }
 
+        protected bool UseEmscriptenExternal (MethodInfo method) {
+            foreach (var sa in Configuration.Assemblies.EmscriptenExternals) {
+                if (Regex.IsMatch(method.DeclaringType.Identifier.Assembly, sa,
+                                  RegexOptions.IgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        class EmscriptenParameterInfo {
+            public EmscriptenParameterInfo() {
+                PreCall = new List<string>();
+                PostCall = new List<string>();
+            }
+
+            public string InParameterName;
+            public string TranslatedParameterName;
+            public List<string> PreCall;
+            public List<string> PostCall;
+
+            public void Pre (string format, params object[] args) {
+                PreCall.Add(String.Format(format, args));
+            }
+
+            public void Post (string format, params object[] args) {
+                PostCall.Add(String.Format(format, args));
+            }
+
+        }
+
+        protected void EmitEmscriptenStub (JavascriptFormatter output, MethodInfo methodInfo) {
+            if (/*!methodInfo.IsStatic ||*/ !methodInfo.IsExternal) {
+                WarningFormat("Method {0} must be static and external to generate an emscripten stub", methodInfo);
+                return;
+            }
+
+            if (methodInfo.GenericParameterNames.Length > 0) {
+                WarningFormat("Method {0} must not have any generic parameters to generate an emscripten stub", methodInfo);
+                return;
+            }
+
+            var emps = new List<EmscriptenParameterInfo>();
+            bool needStackSave = false;
+
+            // first check the parameters, make sure they're all valid
+            foreach (var p in methodInfo.Parameters) {
+                var emp = new EmscriptenParameterInfo();
+                emp.InParameterName = p.Name;
+
+                bool bad = false;
+                if (p.ParameterType is ByReferenceType ||
+                    p.IsOut ||
+                    p.IsOptional ||
+                    p.HasDefault ||
+                    p.HasFieldMarshal ||
+                    p.IsReturnValue)
+                {
+                    WarningFormat("Method {0} has parameter {1} that we can't generate an emscripten stub for.", methodInfo, p);
+                    return;
+                }
+
+                switch (p.ParameterType.MetadataType) {
+                case MetadataType.SByte:
+                case MetadataType.Byte:
+                case MetadataType.Int16:
+                case MetadataType.UInt16:
+                case MetadataType.Int32:
+                case MetadataType.UInt32:
+                case MetadataType.Int64:
+                case MetadataType.UInt64:
+                case MetadataType.Single:
+                case MetadataType.Double:
+                    // no translation is neeeded for these value types; just pass them directly.
+                    emp.TranslatedParameterName = emp.InParameterName;
+                    break;
+
+                case MetadataType.Boolean:
+                    emp.TranslatedParameterName = emp.InParameterName + "_t";
+                    emp.Pre("var {0} = {1} ? 1 : 0;", emp.TranslatedParameterName, emp.InParameterName);
+                    break;
+
+                case MetadataType.Char:
+                    emp.TranslatedParameterName = emp.InParameterName + "_t";
+                    emp.Pre("var {0} = {1}.charCodeAt(0)", emp.TranslatedParameterName, emp.InParameterName);
+                    break;
+
+                case MetadataType.Array: {
+                    // Arrays are special.  For Emscripten, we need to put the data into the
+                    // Emscripten heap so that we can pass an address to them.  This means we
+                    // need to allocate memory and then copy the data in to the heap.
+
+                    // Only arrays of single-dimension primitive types are supported
+                    TypeReference elementType = p.ParameterType.GetElementType();
+
+                    emp.TranslatedParameterName = emp.InParameterName + "_t";
+                    string heapTarget = null;
+                    int heapShift = 0;
+
+                    switch (elementType.MetadataType) {
+                    case MetadataType.SByte:
+                        heapTarget = "HEAP8";
+                        heapShift = 0;
+                        break;
+
+                    case MetadataType.Byte:
+                        heapTarget = "HEAPU8";
+                        heapShift = 0;
+                        break;
+
+                    case MetadataType.Int16:
+                        heapTarget = "HEAP16";
+                        heapShift = 1;
+                        break;
+
+                    case MetadataType.UInt16:
+                        heapTarget = "HEAPU16";
+                        heapShift = 1;
+                        break;
+
+                    case MetadataType.Int32:
+                        heapTarget = "HEAP32";
+                        heapShift = 2;
+                        break;
+
+                    case MetadataType.UInt32:
+                        heapTarget = "HEAPU32";
+                        heapShift = 2;
+                        break;
+
+                    case MetadataType.Single:
+                        heapTarget = "HEAPF32";
+                        heapShift = 2;
+                        break;
+
+                    case MetadataType.Double:
+                        heapTarget = "HEAPF64";
+                        heapShift = 3;
+                        break;
+
+                    case MetadataType.Boolean:
+                    case MetadataType.Char:
+                    case MetadataType.IntPtr:
+                    case MetadataType.UIntPtr:
+                    default:
+                        WarningFormat("Emscripten-external method {0} has array parameter {1} of type {2} (metadata: {3}): FIXME.",
+                                      methodInfo, p, p.ParameterType, p.ParameterType.MetadataType);
+
+                        emp.TranslatedParameterName = emp.InParameterName + "_t";
+                        emp.Pre("var {0} = null; /* Untranslatable */", emp.TranslatedParameterName);
+                        break;
+                    }
+
+                    if (heapTarget != null) {
+                        // we're going to assume that these are going to be typed arrays,
+                        // since emscripten requires them
+                        needStackSave = true;
+
+                        emp.Pre("if ({0}.byteLength == 0) {{", emp.InParameterName);
+                        emp.Pre("  var {0} = 0;", emp.TranslatedParameterName);
+                        emp.Pre("}} else if ({0}.byteLength <= 128) {{", emp.InParameterName);
+                        emp.Pre("  var {0} = Runtime.stackAlloc({1}.byteLength);", emp.TranslatedParameterName, emp.InParameterName);
+                        emp.Pre("}} else {{");
+                        emp.Pre("  var {0} = Runtime._malloc({1}.byteLength);", emp.TranslatedParameterName, emp.InParameterName);
+                        emp.Pre("}}");
+                        emp.Pre("{0}.set({1}, {2} >> {3});", heapTarget, emp.InParameterName, emp.TranslatedParameterName, heapShift);
+
+                        emp.Post("if ({0}.byteLength > 128) {{", emp.InParameterName);
+                        emp.Post("  Runtime._free({0});", emp.TranslatedParameterName);
+                        emp.Post("}}");
+                    }
+
+                        break;
+
+                }
+                    break;
+
+                case MetadataType.String: {
+                    emp.TranslatedParameterName = emp.InParameterName + "_t";
+                    needStackSave = true;
+
+                    emp.Pre("if ({0}.length <= 128) {{", emp.InParameterName);
+                    emp.Pre("  var {0} = Runtime.stackAlloc({1}.length + 1);", emp.TranslatedParameterName, emp.InParameterName);
+                    emp.Pre("}} else {{");
+                    emp.Pre("  var {0} = Runtime._malloc({1}.length + 1);", emp.TranslatedParameterName, emp.InParameterName);
+                    emp.Pre("}}");
+
+                    emp.Pre("var $tmp0 = {0};", emp.TranslatedParameterName);
+                    emp.Pre("for (var $i = 0; $i < {0}.length; ++i) {{", emp.InParameterName);
+                    emp.Pre("  HEAPU8[$tmp0++] = {0}.charCodeAt(i);", emp.InParameterName);
+                    emp.Pre("}}");
+                    emp.Pre("HEAPU8[$tmp0] = 0;");
+
+                    emp.Post("if ({0}.length > 128) {{", emp.InParameterName);
+                    emp.Post("  Runtime._free({0});", emp.TranslatedParameterName);
+                    emp.Post("}}");
+                }
+                    break;
+
+                // In the future, we need to support these specific bits:
+                case MetadataType.IntPtr:
+                case MetadataType.UIntPtr:
+                default:
+                    WarningFormat("Emscripten-external method {0} has parameter {1} of type {2} (metadata: {3}): FIXME.",
+                                  methodInfo, p, p.ParameterType, p.ParameterType.MetadataType);
+
+                    emp.TranslatedParameterName = emp.InParameterName + "_t";
+                    emp.PreCall.Add(String.Format("var {0} = null; /* Untranslatable */", emp.TranslatedParameterName));
+                    break;
+                }
+
+                emps.Add(emp);
+            }
+
+            output.OpenFunction(methodInfo.Name + "_emscripten",
+                                (o) => output.WriteParameterList(
+                                    (from p in methodInfo.Parameters select
+                                     new JSParameter(p.Name, p.ParameterType, null))));
+
+            if (needStackSave) {
+                output.WriteRaw("var $sp = Runtime.stackSave();");
+                output.NewLine();
+            }
+
+            foreach (var emp in emps) {
+                foreach (var s in emp.PreCall) {
+                    output.WriteRaw(s);
+                    output.NewLine();
+                }
+            }
+
+            output.NewLine();
+            if (methodInfo.ReturnType.MetadataType != MetadataType.Void) {
+                output.WriteRaw("var $rval = ");
+            }
+
+            output.Identifier("_" + methodInfo.Name);
+            output.LPar();
+            for (int i = 0; i < emps.Count; ++i) {
+                if (i > 0) {
+                    output.Comma();
+                    output.Space();
+                }
+
+                output.Identifier(emps[i].TranslatedParameterName);
+            }
+            output.RPar();
+            output.Semicolon();
+            output.NewLine();
+
+            foreach (var emp in emps) {
+                foreach (var s in emp.PostCall) {
+                    output.WriteRaw(s);
+                    output.NewLine();
+                }
+            }
+
+            if (needStackSave) {
+                output.WriteRaw("Runtime.stackRestore($sp);");
+                output.NewLine();
+            }
+
+            if (methodInfo.ReturnType.MetadataType != MetadataType.Void) {
+                // XXX do any needed translation
+                output.WriteRaw("return $rval;");
+                output.NewLine();
+            }
+
+            output.CloseBrace(false);
+        }
+
         protected void TranslateMethod (
             DecompilerContext context, MethodReference methodRef, MethodDefinition method,
             JavascriptAstEmitter astEmitter, JavascriptFormatter output, bool stubbed, 
@@ -2131,7 +2404,9 @@ namespace JSIL {
             ))
                 return;
 
-            var makeSkeleton = stubbed && isExternal && Configuration.GenerateSkeletonsForStubbedAssemblies.GetValueOrDefault(false);
+            var useEmscriptenExternal = isExternal && UseEmscriptenExternal(methodInfo);
+            var generateSkeletons = isExternal && Configuration.GenerateSkeletonsForStubbedAssemblies.GetValueOrDefault(false);
+            var makeSkeleton = stubbed && isExternal && generateSkeletons;
 
             JSFunctionExpression function;
             try {
@@ -2158,7 +2433,9 @@ namespace JSIL {
             try {
                 dollar(output);
                 output.Dot();
-                if (isExternal && !Configuration.GenerateSkeletonsForStubbedAssemblies.GetValueOrDefault(false))
+                if (useEmscriptenExternal)
+                    output.Identifier("ExternalEmscriptenMethod", null);
+                else if (isExternal && !generateSkeletons)
                     output.Identifier("ExternalMethod", null);
                 else
                     output.Identifier("Method", null);
@@ -2197,6 +2474,11 @@ namespace JSIL {
                         output.Value(method.FullName);
                         output.RPar();
                     }
+                } else if (useEmscriptenExternal) {
+                    output.Comma();
+                    output.NewLine();
+
+                    EmitEmscriptenStub(output, methodInfo);
                 } else if (makeSkeleton) {
                     output.Comma();
                     output.NewLine();

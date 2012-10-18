@@ -10,13 +10,14 @@ namespace JSIL.Translator {
         public sealed class AssemblyConfiguration {
             public readonly List<string> Ignored = new List<string>();
             public readonly List<string> Stubbed = new List<string>();
-
             public readonly List<string> Proxies = new List<string>();
+            public readonly List<string> EmscriptenExternals = new List<string>();
 
             public void MergeInto (AssemblyConfiguration result) {
                 result.Ignored.AddRange(Ignored);
                 result.Stubbed.AddRange(Stubbed);
                 result.Proxies.AddRange(Proxies);
+                result.EmscriptenExternals.AddRange(EmscriptenExternals);
             }
         }
 

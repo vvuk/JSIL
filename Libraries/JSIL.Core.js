@@ -5082,6 +5082,8 @@ JSIL.InterfaceBuilder.prototype.Method = function (_descriptor, methodName, sign
   return memberBuilder;
 };
 
+JSIL.InterfaceBuilder.prototype.ExternalEmscriptenMethod = JSIL.InterfaceBuilder.prototype.Method;
+
 JSIL.InterfaceBuilder.prototype.InheritBaseMethod = function (name) {
   var signature = new JSIL.MethodSignature(null, [], []);
   var descriptor = this.ParseDescriptor({Public: true, Static: false}, name, signature);
