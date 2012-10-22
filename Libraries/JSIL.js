@@ -198,6 +198,9 @@ var $jsilloaderstate = {
   if (config.readOnlyStorage)
     contentManifest["JSIL"].push(["Library", "JSIL.ReadOnlyStorage.js"]);
 
+  if (config.mono)
+    contentManifest["JSIL"].push(["Library", "JSIL.Mono.js"]);
+
   if (config.localStorage)
     contentManifest["JSIL"].push(["Library", "JSIL.LocalStorage.js"]);
 

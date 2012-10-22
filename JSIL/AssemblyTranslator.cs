@@ -713,6 +713,14 @@ namespace JSIL {
 
             foreach (var typedef in module.Types)
                 DeclareType(context, typedef, astEmitter, output, declaredTypes, stubbed);
+
+            if (module.EntryPoint != null) {
+                output.NewLine();
+                output.WriteRaw("JSIL.SetEntryPoint(\"{0}\", \"{1}\");",
+                                module.EntryPoint.DeclaringType.FullName,
+                                module.EntryPoint.Name);
+                output.NewLine();
+            }
         }
 
         protected void TranslateInterface (DecompilerContext context, JavascriptFormatter output, TypeDefinition iface) {
@@ -2139,6 +2147,8 @@ namespace JSIL {
             case MetadataType.Int32:
             case MetadataType.UInt32:
             case MetadataType.Single:
+            case MetadataType.IntPtr:  // XXX assuming emscripten is always 32-bit
+            case MetadataType.UIntPtr: // XXX assuming emscripten is always 32-bit
                 return 2;
             case MetadataType.Int64:
             case MetadataType.UInt64:
@@ -2162,6 +2172,9 @@ namespace JSIL {
 
             case MetadataType.Char:   return "HEAPU16";
             case MetadataType.Boolean: return "HEAP8";
+
+            case MetadataType.IntPtr: return "HEAP32";
+            case MetadataType.UIntPtr: return "HEAPU32";
             }
 
             return null;
@@ -2170,10 +2183,17 @@ namespace JSIL {
         class EmscriptenParameterInfo {
             static int EMSCRIPTEN_STACK_ALLOC_LIMIT = 128;
 
-            public EmscriptenParameterInfo() {
+            EmscriptenParameterInfo() {
                 PreCall = new List<string>();
                 PostCall = new List<string>();
                 NeedStackSave = false;
+            }
+
+            public EmscriptenParameterInfo(string ParameterName)
+              : this()
+            {
+                InParameterName = ParameterName;
+                TranslatedParameterName = ParameterName + "_t";
             }
 
             public string InParameterName;
@@ -2212,10 +2232,10 @@ namespace JSIL {
 
 
             // same as above, but for constant bytes
-            public void PreAlloc (int byteSize) {
+            public void PreAlloc (int byteSize, bool forceHeap = false) {
                 if (byteSize == 0) {
                     Pre("var {0} = 0;", TranslatedParameterName);
-                } else if (byteSize <= EMSCRIPTEN_STACK_ALLOC_LIMIT) {
+                } else if (!forceHeap && byteSize <= EMSCRIPTEN_STACK_ALLOC_LIMIT) {
                     Pre("var {0} = Runtime.stackAlloc({1});", TranslatedParameterName, byteSize);
                     NeedStackSave = true;
                 } else {
@@ -2223,16 +2243,49 @@ namespace JSIL {
                 }
             }
 
-            public void PostFree (int byteSize) {
-                if (byteSize > EMSCRIPTEN_STACK_ALLOC_LIMIT) {
+            public void PostFree (int byteSize, bool forceHeap = false) {
+                if (forceHeap || byteSize > EMSCRIPTEN_STACK_ALLOC_LIMIT) {
                     Post("Runtime._free({0});", TranslatedParameterName);
                 }
+            }
+
+            public void PreObjectPreamble () {
+                Pre("JSIL.PushObjectRootStore();");
+            }
+
+            public void PostObjectPremable () {
+                Post("JSIL.PopObjectRootStore();");
+            }
+
+            public void PreConvertObject (TypeReference typeRef) {
+                switch (typeRef.MetadataType) {
+                case MetadataType.String:
+                case MetadataType.Array:
+                    Pre("var {0} = JSIL.TempRootObject(new JSIL.Variable({1}));", TranslatedParameterName, InParameterName);
+                    break;
+
+                case MetadataType.Object:
+                    // allocate/find the pointer-index for this
+                    Pre("var {0} = JSIL.TempRootObject({1});", TranslatedParameterName, InParameterName);
+                    break;
+
+                default:
+                    Console.Error.WriteLine(String.Format("Warning: PreConvertObject: can't deal with metadata type {0} for parameter {1}",
+                                                          typeRef.MetadataType, InParameterName));
+                    Pre("var {0} = 0; /* FIXME UNHANDLED */", TranslatedParameterName);
+                    break;
+                }
+            }
+
+            public void PostConvertObject (TypeReference typeRef) {
+                // nothing to do here for now; any cleanup happens in
+                // PopObjectRootStore()
             }
         }
 
         protected void EmitEmscriptenStub (JavascriptFormatter output, MethodInfo methodInfo) {
-            if (/*!methodInfo.IsStatic ||*/ !methodInfo.IsExternal) {
-                WarningFormat("Method {0} must be static and external to generate an emscripten stub", methodInfo);
+            if (!methodInfo.IsExternal) {
+                WarningFormat("Method {0} must be external to generate an emscripten stub", methodInfo);
                 return;
             }
 
@@ -2243,11 +2296,24 @@ namespace JSIL {
 
             var emps = new List<EmscriptenParameterInfo>();
             bool needStackSave = false;
+            bool alreadyDidObjectPreamble = false;
 
-            // first check the parameters, make sure they're all valid
+            if (!methodInfo.IsStatic) {
+                // Non-static method; the first argument is a 'this' pointer, as a MonoObject*.
+                var emp = new EmscriptenParameterInfo("this");
+                if (!alreadyDidObjectPreamble)
+                    emp.PreObjectPreamble();
+                emp.PreConvertObject(methodInfo.DeclaringType.Definition);
+                emp.PostConvertObject(methodInfo.DeclaringType.Definition);
+                if (!alreadyDidObjectPreamble)
+                    emp.PostObjectPremable();
+
+                alreadyDidObjectPreamble = true;
+            }
+
+            // go through the parameters, creating conversions as necessary
             foreach (var p in methodInfo.Parameters) {
-                var emp = new EmscriptenParameterInfo();
-                emp.InParameterName = p.Name;
+                var emp = new EmscriptenParameterInfo(p.Name);
 
                 MetadataType mdtype = p.ParameterType.MetadataType;
                 bool byRef = p.ParameterType.IsByReference || p.IsOut;
@@ -2278,9 +2344,10 @@ namespace JSIL {
                     case MetadataType.Int64:
                     case MetadataType.UInt64:
                     case MetadataType.Single:
-                    case MetadataType.Double: {
+                    case MetadataType.Double:
+                    case MetadataType.IntPtr:
+                    case MetadataType.UIntPtr: {
                         // this is a "JSIL.Variable", with a .value property
-                        emp.TranslatedParameterName = emp.InParameterName + "_t";
                         int shift = EmscriptenHeapShiftForMetadataType(mdtype);
                         int byteSize = 1 << shift;
                         emp.PreAlloc(byteSize);
@@ -2304,7 +2371,6 @@ namespace JSIL {
                         break;
 
                     case MetadataType.Boolean: {
-                        emp.TranslatedParameterName = emp.InParameterName + "_t";
                         int shift = EmscriptenHeapShiftForMetadataType(mdtype);
                         int byteSize = 1 << shift;
                         emp.PreAlloc(byteSize);
@@ -2326,7 +2392,6 @@ namespace JSIL {
                         break;
 
                     case MetadataType.Char: {
-                        emp.TranslatedParameterName = emp.InParameterName + "_t";
                         int shift = EmscriptenHeapShiftForMetadataType(mdtype);
                         int byteSize = 1 << shift;
                         emp.PreAlloc(byteSize);
@@ -2350,13 +2415,10 @@ namespace JSIL {
 
                     case MetadataType.Array: /* arrays come in as MonoArray */
                     case MetadataType.String: /* strings come in as MonoString* */
-                    case MetadataType.IntPtr:
-                    case MetadataType.UIntPtr:
                     default:
                         WarningFormat("Emscripten-external method {0} has parameter {1} of type {2} (metadata: {3}): FIXME.",
                                       methodInfo, p, p.ParameterType, mdtype);
 
-                        emp.TranslatedParameterName = emp.InParameterName + "_t";
                         emp.Pre("var {0} = null; /* Untranslatable */", emp.TranslatedParameterName);
                         break;
                     }
@@ -2372,96 +2434,99 @@ namespace JSIL {
                     case MetadataType.UInt64:
                     case MetadataType.Single:
                     case MetadataType.Double:
+                    case MetadataType.IntPtr:
+                    case MetadataType.UIntPtr:
                         // no translation is neeeded for these value types; just pass them directly
                         emp.TranslatedParameterName = emp.InParameterName;
                         break;
 
                     case MetadataType.Boolean:
-                        emp.TranslatedParameterName = emp.InParameterName + "_t";
                         emp.Pre("var {0} = {1} ? 1 : 0;", emp.TranslatedParameterName, emp.InParameterName);
                         break;
 
                     case MetadataType.Char:
-                        emp.TranslatedParameterName = emp.InParameterName + "_t";
                         emp.Pre("var {0} = {1}.charCodeAt(0)", emp.TranslatedParameterName, emp.InParameterName);
                         break;
 
-                    /* XXX FIXME - for InternalCall, arrays come in as MonoArray */
-                    case MetadataType.Array: {
-                        // Arrays are special.  For Emscripten, we need to put the data into the
-                        // Emscripten heap so that we can pass an address to them.  This means we
-                        // need to allocate memory and then copy the data in to the heap.
+                    // object variables; non-ref/out, non-array members
 
-                        // Only arrays of single-dimension primitive types are supported
-                        TypeReference elementType = p.ParameterType.GetElementType();
-
-                        emp.TranslatedParameterName = emp.InParameterName + "_t";
-                        string heapTarget = null;
-                        int heapShift = 0;
-
-                        switch (elementType.MetadataType) {
-                        case MetadataType.SByte:
-                        case MetadataType.Byte:
-                        case MetadataType.Int16:
-                        case MetadataType.UInt16:
-                        case MetadataType.Int32:
-                        case MetadataType.UInt32:
-                        case MetadataType.Single:
-                        case MetadataType.Double:
-                            heapTarget = EmscriptenHeapForMetadataType(elementType.MetadataType);
-                            heapShift = EmscriptenHeapShiftForMetadataType(elementType.MetadataType);
-                            break;
-
-                        case MetadataType.Boolean:
-                        case MetadataType.Char:
-                        case MetadataType.IntPtr:
-                        case MetadataType.UIntPtr:
-                        default:
-                            WarningFormat("Emscripten-external method {0} has array parameter {1} of type {2} (metadata: {3}): FIXME.",
-                                          methodInfo, p, p.ParameterType, mdtype);
-
-                            emp.Pre("var {0} = null; /* Untranslatable */", emp.TranslatedParameterName);
-                            break;
-                        }
-
-                        if (heapTarget != null) {
-                            // we're going to assume that these are going to be typed arrays,
-                            // since emscripten requires them
-                            emp.PreAlloc(emp.InParameterName + ".byteLength");
-                            emp.Pre("{0}.set({1}, {2} >> {3});", heapTarget, emp.InParameterName, emp.TranslatedParameterName, heapShift);
-
-                            emp.PostFree(emp.InParameterName + ".byteLength");
-                        }
-
-                        break;
-
+                    // these two need wrapping as JSIL.Variable so that they can get rooted etc.
+                    // properly.
+                    case MetadataType.String: /* strings are passed as MonoString* */
+                    case MetadataType.Array: /* arrays are passed as MonoArray* */
+                    case MetadataType.Object: { /* objects are passed as MonoObject* */
+                        if (!alreadyDidObjectPreamble)
+                            emp.PreObjectPreamble();
+                        emp.PreConvertObject(p.ParameterType);
+                        emp.PostConvertObject(p.ParameterType);
+                        if (!alreadyDidObjectPreamble)
+                            emp.PostObjectPremable();
                     }
                         break;
 
-                        /* This is some code to convert a string to a byte array, unused */
-                        // {
-                        //     emp.TranslatedParameterName = emp.InParameterName + "_t";
-                        //     string byteLengthExpression = String.Format("((({0}.length)+1)*2)", emp.InParameterName);
-                        //     emp.PreAlloc(byteLengthExpression);
-                        //     // Copy the string in, one byte at a time
-                        //     emp.Pre("var $tmp0 = {0};", emp.TranslatedParameterName);
-                        //     emp.Pre("for (var $i = 0; $i < {0}.length; ++i) {{", emp.InParameterName);
-                        //     emp.Pre("  HEAPU8[$tmp0++] = {0}.charCodeAt(i);", emp.InParameterName);
-                        //     emp.Pre("}}");
-                        //     emp.Pre("HEAPU8[$tmp0] = 0;");
-                        //     emp.PostFree(byteLengthExpression);
-                        // }
-                        //     break;
+                    // // this is really for P/Invoke:
+                    // case MetadataType.Array: {
+                    //     // Arrays are special.  For Emscripten, we need to put the data into the
+                    //     // Emscripten heap so that we can pass an address to them.  This means we
+                    //     // need to allocate memory and then copy the data in to the heap.
 
-                        // In the future, we need to support these specific bits:
-                    case MetadataType.String: /* strings come in as MonoString* */
-                    case MetadataType.IntPtr:
-                    case MetadataType.UIntPtr:
+                    //     // Only arrays of single-dimension primitive types are supported
+                    //     TypeReference elementType = p.ParameterType.GetElementType();
+
+                    //     string heapTarget = null;
+                    //     int heapShift = 0;
+
+                    //     switch (elementType.MetadataType) {
+                    //     case MetadataType.SByte:
+                    //     case MetadataType.Byte:
+                    //     case MetadataType.Int16:
+                    //     case MetadataType.UInt16:
+                    //     case MetadataType.Int32:
+                    //     case MetadataType.UInt32:
+                    //     case MetadataType.Single:
+                    //     case MetadataType.Double:
+                    //     case MetadataType.IntPtr:
+                    //     case MetadataType.UIntPtr:
+                    //         heapTarget = EmscriptenHeapForMetadataType(elementType.MetadataType);
+                    //         heapShift = EmscriptenHeapShiftForMetadataType(elementType.MetadataType);
+                    //         break;
+
+                    //     case MetadataType.Boolean:
+                    //     case MetadataType.Char:
+                    //     default:
+                    //         WarningFormat("Emscripten-external method {0} has array parameter {1} of type {2} (metadata: {3}): FIXME.",
+                    //                       methodInfo, p, p.ParameterType, mdtype);
+
+                    //         emp.Pre("var {0} = null; /* Untranslatable */", emp.TranslatedParameterName);
+                    //         break;
+                    //     }
+
+                    //     if (heapTarget != null) {
+                    //         // we're going to assume that these are going to be typed arrays,
+                    //         // since emscripten requires them
+                    //         emp.PreAlloc(emp.InParameterName + ".byteLength");
+                    //         emp.Pre("{0}.set({1}, {2} >> {3});", heapTarget, emp.InParameterName, emp.TranslatedParameterName, heapShift);
+                    //         emp.PostFree(emp.InParameterName + ".byteLength");
+                    //     }
+                    // }
+                    //     break;
+                    // case MetadataType.String: {
+                    //     string byteLengthExpression = String.Format("((({0}.length)+1)*2)", emp.InParameterName);
+                    //     emp.PreAlloc(byteLengthExpression);
+                    //     // Copy the string in, one byte at a time
+                    //     emp.Pre("var $tmp0 = {0};", emp.TranslatedParameterName);
+                    //     emp.Pre("for (var $i = 0; $i < {0}.length; ++i) {{", emp.InParameterName);
+                    //     emp.Pre("  HEAPU8[$tmp0++] = {0}.charCodeAt(i);", emp.InParameterName);
+                    //     emp.Pre("}}");
+                    //     emp.Pre("HEAPU8[$tmp0] = 0;");
+                    //     emp.PostFree(byteLengthExpression);
+                    // }
+                    //     break;
+
                     default:
                         WarningFormat("Emscripten-external method {0} has parameter {1} of type {2} (metadata: {3}): FIXME.",
                                       methodInfo, p, p.ParameterType, mdtype);
 
-                        emp.TranslatedParameterName = emp.InParameterName + "_t";
                         emp.Pre("var {0} = null; /* Untranslatable */", emp.TranslatedParameterName);
                         break;
                     }
@@ -2520,10 +2585,41 @@ namespace JSIL {
                 output.NewLine();
             }
 
-            if (methodInfo.ReturnType.MetadataType != MetadataType.Void) {
-                // XXX do any needed translation
+            switch (methodInfo.ReturnType.MetadataType) {
+            case MetadataType.SByte:
+            case MetadataType.Byte:
+            case MetadataType.Boolean:
+            case MetadataType.Int16:
+            case MetadataType.UInt16:
+            case MetadataType.Char:
+            case MetadataType.Int32:
+            case MetadataType.UInt32:
+            case MetadataType.Single:
+            case MetadataType.IntPtr:
+            case MetadataType.UIntPtr:
+            case MetadataType.Int64:
+            case MetadataType.UInt64:
+            case MetadataType.Double:
                 output.WriteRaw("return $rval;");
                 output.NewLine();
+                break;
+
+            case MetadataType.String:
+            case MetadataType.Array:
+            case MetadataType.Object:
+                output.WriteRaw("return JSIL.ObjectFromMonoObjectPtr($rval);");
+                output.NewLine();
+                break;
+
+            case MetadataType.Void:
+                break;
+
+            default:
+                WarningFormat("Unknown return metadata type {0} ({1}) of method {2}!", methodInfo.ReturnType.MetadataType,
+                              methodInfo.ReturnType, methodInfo.Name);
+                output.WriteRaw("return; /* FIXME UNKNOWN RETURN TYPE */");
+                output.NewLine();
+                break;
             }
 
             output.CloseBrace(false);

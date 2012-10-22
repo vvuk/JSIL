@@ -274,6 +274,18 @@ JSIL.GetAssembly = function (assemblyName, requireExisting) {
   return result;
 };
 
+JSIL.SetEntryPoint = function (className, methodName) {
+  // someone who knows what they're doing should fix this
+  var $thisAssembly = $private;
+  JSIL.SetValueProperty($private, "__CallEntryPoint__", function(args) {
+    var type = JSIL.GetTypeByName(className, $thisAssembly);
+//    print("class: " + className);
+//    print("method: " + methodName);
+//    print("type: " + type);
+//    print("method: " + type[methodName]);
+    return type[methodName].call(args);
+  });
+};
 
 var $jsilcore = JSIL.DeclareAssembly("JSIL.Core");
 
