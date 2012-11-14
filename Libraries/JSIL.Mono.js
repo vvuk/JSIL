@@ -50,6 +50,10 @@ JSIL.DumpObjectRootStats = function () {
     }
   }
 
+  // make the output pretty
+  if (permCount == 0 && tempCount == 0)
+    minIndex = 0;
+
   JSIL.Host.logWriteLine("Root stats: " + permCount + " permanent, " + tempCount + " temporary -- min: " + minIndex + " max: " + maxIndex);
 };
 
@@ -136,6 +140,13 @@ JSIL.ObjectFromMonoObjectPtr = function (objptr) {
   // this makes no attempt to verify the type of the object being returned
   if (objptr == 0)
     return null;
+
+  // it's in the new object root
+  if (JSIL.NewObjectRootIndex == objptr) {
+    if (JSIL.NewObjectRoot instanceof JSIL.Variable)
+      return JSIL.NewObjectRoot.value;
+    return JSIL.NewObjectRoot;
+  }
 
   for (var i = 0; i < JSIL.RootStack.length; ++i) {
     var roots = JSIL.RootStack[i];
