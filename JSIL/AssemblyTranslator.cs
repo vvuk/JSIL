@@ -2265,6 +2265,7 @@ namespace JSIL {
                     break;
 
                 case MetadataType.Object:
+                case MetadataType.Class:
                     // allocate/find the pointer-index for this
                     Pre("var {0} = JSIL.TempRootObject({1});", TranslatedParameterName, InParameterName);
                     break;
@@ -2416,7 +2417,7 @@ namespace JSIL {
                     case MetadataType.Array: /* arrays come in as MonoArray */
                     case MetadataType.String: /* strings come in as MonoString* */
                     default:
-                        WarningFormat("Emscripten-external method {0} has parameter {1} of type {2} (metadata: {3}): FIXME.",
+                        WarningFormat("Emscripten-external method {0} has byRef parameter {1} of type {2} (metadata: {3}): FIXME.",
                                       methodInfo, p, p.ParameterType, mdtype);
 
                         emp.Pre("var {0} = null; /* Untranslatable */", emp.TranslatedParameterName);
@@ -2445,13 +2446,18 @@ namespace JSIL {
                         break;
 
                     case MetadataType.Char:
-                        emp.Pre("var {0} = {1}.charCodeAt(0)", emp.TranslatedParameterName, emp.InParameterName);
+                        emp.Pre("var {0} = {1}.charCodeAt(0);", emp.TranslatedParameterName, emp.InParameterName);
+                        break;
+
+                    case MetadataType.ValueType:
+                        emp.Pre("var {0} = {1}.valueOf();", emp.TranslatedParameterName, emp.InParameterName);
                         break;
 
                     // object variables; non-ref/out, non-array members
 
                     // these two need wrapping as JSIL.Variable so that they can get rooted etc.
                     // properly.
+                    case MetadataType.Class: /* as a MonoObject* */
                     case MetadataType.String: /* strings are passed as MonoString* */
                     case MetadataType.Array: /* arrays are passed as MonoArray* */
                     case MetadataType.Object: { /* objects are passed as MonoObject* */
