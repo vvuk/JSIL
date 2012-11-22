@@ -821,8 +821,10 @@ namespace JSIL {
             output.NewLine();
         }
 
-        protected void TranslateEnum (DecompilerContext context, JavascriptFormatter output, TypeDefinition enm) {
+        protected void TranslateEnum (DecompilerContext context, JavascriptFormatter output, TypeDefinition enm,
+                                      TypeReferenceContext refContext) {
             var typeInfo = _TypeInfoProvider.GetTypeInformation(enm);
+            var underlyingType = enm.GetEnumUnderlyingType();
 
             output.Identifier("JSIL.MakeEnum", null);
             output.LPar();
@@ -861,6 +863,9 @@ namespace JSIL {
             output.CloseBrace(false);
             output.Comma();
             output.Value(typeInformation.IsFlagsEnum);
+            output.Comma();
+            output.NewLine();
+            output.TypeReference(underlyingType, refContext);
             output.NewLine();
 
             output.RPar();
@@ -975,7 +980,7 @@ namespace JSIL {
                     TranslateInterface(context, output, typedef);
                     return;
                 } else if (typedef.IsEnum) {
-                    TranslateEnum(context, output, typedef);
+                    TranslateEnum(context, output, typedef, astEmitter.ReferenceContext);
                     return;
                 } else if (typeInfo.IsDelegate) {
                     TranslateDelegate(context, output, typedef, typeInfo);
@@ -1133,6 +1138,7 @@ namespace JSIL {
         ) {
             bool isIntegral = false;
             bool isNumeric = false;
+            int sizeOf = -1;
 
             switch (typedef.FullName) {
                 case "System.Boolean":
@@ -1162,14 +1168,40 @@ namespace JSIL {
                     break;
             }
 
-            var setValue = (Action<string, bool>)((name, value) => {
+            switch (typedef.FullName) {
+                case "System.Boolean":
+                case "System.Char":
+                case "System.Byte":
+                case "System.SByte":
+                    sizeOf = 1;
+                    break;
+                case "System.UInt16":
+                case "System.Int16":
+                    sizeOf = 2;
+                    break;
+                case "System.UInt32":
+                case "System.Int32":
+                case "System.Single":
+                    sizeOf = 4;
+                    break;
+                case "System.UInt64":
+                case "System.Int64":
+                case "System.Double":
+                    sizeOf = 8;
+                    break;
+            }
+
+            var setValue = (Action<string, object>)((name, value) => {
                 dollar(output);
                 output.Dot();
                 output.Identifier("SetValue", null);
                 output.LPar();
                 output.Value(name);
                 output.Comma();
-                output.Value(value);
+                if (value is Boolean)
+                    output.Value((bool) value);
+                else if (value is Int32)
+                    output.Value((int) value);
                 output.RPar();
                 output.Semicolon(true);
             });
@@ -1177,6 +1209,10 @@ namespace JSIL {
             setValue("__IsNativeType__", true);
             setValue("__IsIntegral__", isIntegral);
             setValue("__IsNumeric__", isNumeric);
+            if (sizeOf != -1) {
+                setValue("__SizeOf__", sizeOf);
+                setValue("__Alignment__", sizeOf);
+            }
         }
 
         protected void TranslateTypeDefinition (

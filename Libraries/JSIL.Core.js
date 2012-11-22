@@ -1388,6 +1388,32 @@ JSIL.MakeNumericType = function (baseType, typeName, isIntegral, typedArrayName)
     $.SetValue("__IsNumeric__", true);
     $.SetValue("__IsIntegral__", isIntegral);
 
+    if (typeName == "System.Boolean" ||
+        typeName == "System.Char" ||
+        typeName == "System.Byte" ||
+        typeName == "System.SByte")
+    {
+      $.typeObject.__SizeOf__ = 1;
+      $.typeObject.__Alignment__ = 1;
+    } else if (typeName == "System.UInt16" ||
+               typeName == "System.Int16")
+    {
+      $.typeObject.__SizeOf__ = 2;
+      $.typeObject.__Alignment__ = 2;
+    } else if (typeName == "System.UInt32" ||
+               typeName == "System.Int32" ||
+               typeName == "System.Single")
+    {
+      $.typeObject.__SizeOf__ = 4;
+      $.typeObject.__Alignment__ = 4;
+    } else if (typeName == "System.UInt64" ||
+               typeName == "System.Int64" ||
+               typeName == "System.Double")
+    {
+      $.typeObject.__SizeOf__ = 8;
+      $.typeObject.__Alignment__ = 8;
+    }
+
     if (typedArrayName) {
       var typedArrayCtorExists = false;
       var checkFn = new Function("return typeof (" + typedArrayName + ") !== \"undefined\"");
@@ -1797,7 +1823,8 @@ $jsilcore.$Of$NoInitialize = function () {
     "Of", "toString", "__FullName__", "__OfCache__", "Of$NoInitialize",
     "GetType", "__ReflectionCache__", "__Members__", "__ThisTypeId__",
     "__RanCctors__", "__RanFieldInitializers__", "__PreInitMembrane__",
-    "__FieldList__", "__InterfaceMembers__"
+    "__FieldList__", "__InterfaceMembers__",
+    "__StructMarshaller__", "__StructUnmarshaller__"
   ];
 
   // FIXME: for ( in ) is deoptimized in V8. Maybe use Object.keys(), or type metadata?
@@ -4040,6 +4067,8 @@ JSIL.MakeType = function (baseType, fullName, isReferenceType, isPublic, generic
     typeObject.__FieldInitializer__ = $jsilcore.FunctionNotInitialized;
     typeObject.__MemberCopier__ = $jsilcore.FunctionNotInitialized;
     typeObject.__StructComparer__ = $jsilcore.FunctionNotInitialized;
+    typeObject.__StructMarshaller__ = $jsilcore.FunctionNotInitialized;
+    typeObject.__StructUnmarshaller__ = $jsilcore.FunctionNotInitialized;
     typeObject.__Properties__ = [];
     typeObject.__Initializers__ = [];
     typeObject.__Interfaces__ = Array.prototype.slice.call(baseTypeInterfaces);
@@ -4068,6 +4097,11 @@ JSIL.MakeType = function (baseType, fullName, isReferenceType, isPublic, generic
 
     if (stack !== null)
       typeObject.__CallStack__ = stack;
+
+    if (typeObject.__IsStruct__ && !typeObject.__IsIntegral__) {
+      typeObject.__SizeOf__ = -1;
+      typeObject.__Alignment__ = -1;
+    }
 
     var inited = false;
 
@@ -4288,7 +4322,7 @@ JSIL.EnumValue.prototype.valueOf = function () {
   return this.value;
 }
 
-JSIL.MakeEnum = function (fullName, isPublic, members, isFlagsEnum) {
+JSIL.MakeEnum = function (fullName, isPublic, members, isFlagsEnum, storageType) {
   var localName = JSIL.GetLocalName(fullName);
   
   var callStack = null;
@@ -4316,6 +4350,11 @@ JSIL.MakeEnum = function (fullName, isPublic, members, isFlagsEnum) {
     typeObject.__IsEnum__ = true;
     typeObject.__IsValueType__ = true;
     typeObject.__IsReferenceType__ = false;
+
+    var storageTypeObject = JSIL.ResolveTypeReference(storageType)[1];
+    typeObject.__StorageType__ = storageTypeObject;
+    typeObject.__SizeOf__ = storageTypeObject.__SizeOf__;
+    typeObject.__Alignment__ = storageTypeObject.__Alignment__;
 
     var typeId = JSIL.AssignTypeId(context, fullName);
     JSIL.SetValueProperty(typeObject, "__TypeId__", typeId); 
@@ -6108,6 +6147,302 @@ JSIL.StructEquals = function Struct_Equals (lhs, rhs) {
     comparer = thisType.__StructComparer__ = JSIL.$MakeStructComparer(thisType, thisType.__PublicInterface__);
 
   return comparer(lhs, rhs);
+};
+
+JSIL.$ForEachStructTypeField = function(structType, callable) {
+  var members = structType.__Members__;
+  for (var i = 0; i < members.length; i++) {
+    var member = members[i];
+    var desc = member.descriptor;
+    var data = member.data;
+
+    if (desc.Static)
+      continue;
+    if (!data || !data.fieldType)
+      continue;
+    var ft = data.fieldType.get().__Type__;
+    callable(desc.Name, ft, i);
+  }
+};
+
+JSIL.SizeOfStruct = function Struct_SizeOf (structType) {
+  structType = structType.__Type__ || structType;
+  if (structType.__SizeOf__ > -1)
+    return structType.__SizeOf__;
+
+  var totalSize = 0;
+  var maxAlignment = 0;
+
+  JSIL.$ForEachStructTypeField(structType,
+    function (fieldName, fieldType, memberIndex) {
+      var fsz = fieldType.__SizeOf__;
+      var align = fieldType.__Alignment__;
+  
+      maxAlignment = Math.max(maxAlignment, align);
+  
+      //print (fieldName + " " + fieldType + " " + fsz + " (alignment " + align + ")");
+      if (!fsz) {
+        print("No SizeOf for field '" + fieldName + "' in '" + structType + "'!");
+        return;
+      }
+  
+      var delta = totalSize % align;
+      if (delta != 0) {
+        // need to align
+        totalSize += align - delta;
+      }
+  
+      totalSize += fsz;
+    });
+
+  structType.__Alignment__ = maxAlignment;
+  return structType.__SizeOf__ = totalSize;
+};
+
+// target -> data
+JSIL.MarshalStruct = function Struct_Marshal (target, data, offset) {
+  var thisType = target.__ThisType__;
+  var marshaller = thisType.__StructMarshaller__;
+  if (marshaller === $jsilcore.FunctionNotInitialized)
+    marshaller = thisType.__StructMarshaller__ = JSIL.$MakeStructMarshaller(thisType);
+  return marshaller(target, data, offset);
+};
+
+JSIL.$MakeStructMarshaller = function (typeObject) {
+  var body = [];
+  var offsetOffset = 0;
+
+  var need_u8, need_s8, need_u16, need_s16, need_u32, need_s32, need_f32, need_f64;
+
+  JSIL.$ForEachStructTypeField(typeObject,
+    function (fieldName, fieldType, memberIndex) {
+      var align = fieldType.__Alignment__;
+      var delta = offsetOffset % align;
+      if (delta != 0)
+        offsetOffset += align - delta;
+
+      var fieldAccess = JSIL.FormatMemberAccess("target", fieldName);
+      if (fieldType.__IsNumeric__ || fieldType.__IsEnum__) {
+        var storageTypeName;
+        if (fieldType.__IsNumeric__)
+          storageTypeName = fieldType.__FullName__;
+        else if (fieldType.__IsEnum__)
+          storageTypeName = fieldType.__StorageType__.__FullName__;
+
+        switch (fieldType.__SizeOf__) {
+        case 1:
+          if (storageTypeName == "System.Byte") {
+            body.push("data_u8[(offset + " + offsetOffset + ")] = " + fieldAccess + ";");
+            need_u8 = true;
+          } else if (storageTypeName == "System.SByte") {
+            body.push("data_s8[(offset + " + offsetOffset + ")] = " + fieldAccess + ";");
+            need_s8 = true;
+          } else if (storageTypeName == "System.Char") {
+            body.push("data_u8[(offset + " + offsetOffset + ")] = " + fieldAccess + ".charCodeAt(0);");
+            need_u8 = true;
+          } else if (storageTypeName == "System.Boolean") {
+            body.push("data_u8[(offset + " + offsetOffset + ")] = " + fieldAccess + " ? 1 : 0;");
+            need_u8 = true;
+          } else {
+            throw new Error(fieldType + " can't be marshalled.");
+          }
+          break;
+        case 2:
+          if (storageTypeName == "System.UInt16") {
+            body.push("data_u16[(offset + " + offsetOffset + ") >> 1] = " + fieldAccess + ";");
+            need_u16 = true;
+          } else if (storageTypeName == "System.Int16") {
+            body.push("data_s16[(offset + " + offsetOffset + ") >> 1] = " + fieldAccess + ";");
+            need_s16 = true;
+          } else {
+            throw new Error(fieldType + " can't be marshalled.");
+          }
+          break;
+        case 4:
+          if (storageTypeName == "System.UInt32") {
+            body.push("data_u32[(offset + " + offsetOffset + ") >> 2] = " + fieldAccess + ";");
+            need_u32 = true;
+          } else if (storageTypeName == "System.Int32") {
+            body.push("data_s32[(offset + " + offsetOffset + ") >> 2] = " + fieldAccess + ";");
+            need_s32 = true;
+          } else if (storageTypeName == "System.Single") {
+            body.push("data_f32[(offset + " + offsetOffset + ") >> 2] = " + fieldAccess + ";");
+            need_f32 = true;
+          } else {
+            throw new Error(fieldType + " can't be marshalled.");
+          }
+          break;
+        case 8:
+          if (storageTypeName == "System.Double") {
+            body.push("data_f64[(offset + " + offsetOffset + ") >> 3] = " + fieldAccess + ";");
+            need_f64 = true;
+          } else {
+            throw new Error(fieldType + " can't be marshalled.");
+          }
+          break;
+        default:
+          throw new Error(fieldType + " can't be marshalled.");
+        }
+        offsetOffset += fieldType.__SizeOf__;
+      } else if (fieldType.__IsStruct__) {
+        body.push("JSIL.MarshalStruct(" + fieldAccess + ", data, offset + " + offsetOffset + ");");
+        offsetOffset += JSIL.SizeOfStruct(fieldType);
+      } else {
+        // ???
+        print("marshal error: " + fieldName + " type: " + fieldType);
+      }
+    });
+
+  var preamble = [];
+  if (need_u8)
+    preamble.push("var data_u8 = new Uint8Array(data, 0, data.byteLength);");
+  if (need_s8)
+    preamble.push("var data_s8 = new Int8Array(data, 0, data.byteLength);");
+  if (need_u16)
+    preamble.push("var data_u16 = new Uint16Array(data, 0, Math.floor(data.byteLength/2));");
+  if (need_s16)
+    preamble.push("var data_s16 = new Int16Array(data, 0, Math.floor(data.byteLength/2));");
+  if (need_u32)
+    preamble.push("var data_u32 = new Uint32Array(data, 0, Math.floor(data.byteLength/4));");
+  if (need_s32)
+    preamble.push("var data_s32 = new Int32Array(data, 0, Math.floor(data.byteLength/4));");
+  if (need_f32)
+    preamble.push("var data_f32 = new Float32Array(data, 0, Math.floor(data.byteLength/4));");
+  if (need_f64)
+    preamble.push("var data_f64 = new Float64Array(data, 0, Math.floor(data.byteLength/8));");
+
+  if (false) {
+    print("========== generated for: " + typeObject.__FullName__);
+    print(preamble.join('\n') + '\n' + body.join('\n'));
+    print("=================");
+  }
+
+  return JSIL.CreateNamedFunction(typeObject.__FullName__ + ".MarshalStruct",
+                                  ["target", "data", "offset"],
+                                  preamble.join('\n') + '\n' + body.join('\n'));
+};
+
+// data -> target
+JSIL.UnmarshalStruct = function Struct_Unmarshal (target, data, offset) {
+  var thisType = target.__ThisType__;
+  var unmarshaller = thisType.__StructUnmarshaller__;
+  if (unmarshaller === $jsilcore.FunctionNotInitialized)
+    unmarshaller = thisType.__StructUnmarshaller__ = JSIL.$MakeStructUnmarshaller(thisType);
+  return unmarshaller(target, data, offset);
+};
+
+JSIL.$MakeStructUnmarshaller = function (typeObject) {
+  var body = [];
+  var offsetOffset = 0;
+
+  var need_u8, need_s8, need_u16, need_s16, need_u32, need_s32, need_f32, need_f64;
+
+  JSIL.$ForEachStructTypeField(typeObject,
+    function (fieldName, fieldType, memberIndex) {
+      var align = fieldType.__Alignment__;
+      var delta = offsetOffset % align;
+      if (delta != 0)
+        offsetOffset += align - delta;
+
+      var fieldAccess = JSIL.FormatMemberAccess("target", fieldName);
+      if (fieldType.__IsNumeric__ || fieldType.__IsEnum__) {
+        var storageTypeName;
+        if (fieldType.__IsNumeric__)
+          storageTypeName = fieldType.__FullName__;
+        else if (fieldType.__IsEnum__)
+          storageTypeName = fieldType.__StorageType__.__FullName__;
+
+        switch (fieldType.__SizeOf__) {
+        case 1:
+          if (storageTypeName == "System.Byte") {
+            body.push(fieldAccess + " = data_u8[(offset + " + offsetOffset + ")];");
+            need_u8 = true;
+          } else if (storageTypeName == "System.SByte") {
+            body.push(fieldAccess + " = data_s8[(offset + " + offsetOffset + ")];");
+            need_s8 = true;
+          } else if (storageTypeName == "System.Char") {
+            body.push(fieldAccess + " = String.fromCharCode(data_u8[(offset + " + offsetOffset + ")]);");
+            need_u8 = true;
+          } else if (storageTypeName == "System.Boolean") {
+            body.push(fieldAccess + " = data_u8[(offset + " + offsetOffset + ")] ? true : false;");
+            need_u8 = true;
+          } else {
+            throw new Error(fieldType + " can't be unmarshalled.");
+          }
+          break;
+        case 2:
+          if (storageTypeName == "System.UInt16") {
+            body.push(fieldAccess + " = data_u16[(offset + " + offsetOffset + ") >> 1];");
+            need_u16 = true;
+          } else if (storageTypeName == "System.Int16") {
+            body.push(fieldAccess + " = data_s16[(offset + " + offsetOffset + ") >> 1];");
+            need_s16 = true;
+          } else {
+            throw new Error(fieldType + " can't be unmarshalled.");
+          }
+          break;
+        case 4:
+          if (storageTypeName == "System.UInt32") {
+            body.push(fieldAccess + " = data_u32[(offset + " + offsetOffset + ") >> 2];");
+            need_u32 = true;
+          } else if (storageTypeName == "System.Int32") {
+            body.push(fieldAccess + " = data_s32[(offset + " + offsetOffset + ") >> 2];");
+            need_s32 = true;
+          } else if (storageTypeName == "System.Single") {
+            body.push(fieldAccess + " = data_f32[(offset + " + offsetOffset + ") >> 2];");
+            need_f32 = true;
+          } else {
+            throw new Error(fieldType + " can't be unmarshalled.");
+          }
+          break;
+        case 8:
+          if (storageTypeName == "System.Double") {
+            body.push(fieldAccess + " = data_f64[(offset + " + offsetOffset + ") >> 3];");
+            need_f64 = true;
+          } else {
+            throw new Error(fieldType + " can't be unmarshalled.");
+          }
+          break;
+        default:
+          throw new Error(fieldType + " can't be unmarshalled.");
+        }
+        offsetOffset += fieldType.__SizeOf__;
+      } else if (fieldType.__IsStruct__) {
+        body.push("JSIL.UnmarshalStruct(" + fieldAccess + ", data, offset + " + offsetOffset + ");");
+        offsetOffset += JSIL.SizeOfStruct(fieldType);
+      } else {
+        // ???
+        print("unmarshal error: " + fieldName + " type: " + fieldType);
+      }
+    });
+
+  var preamble = [];
+  if (need_u8)
+    preamble.push("var data_u8 = new Uint8Array(data, 0, data.byteLength);");
+  if (need_s8)
+    preamble.push("var data_s8 = new Int8Array(data, 0, data.byteLength);");
+  if (need_u16)
+    preamble.push("var data_u16 = new Uint16Array(data, 0, Math.floor(data.byteLength/2));");
+  if (need_s16)
+    preamble.push("var data_s16 = new Int16Array(data, 0, Math.floor(data.byteLength/2));");
+  if (need_u32)
+    preamble.push("var data_u32 = new Uint32Array(data, 0, Math.floor(data.byteLength/4));");
+  if (need_s32)
+    preamble.push("var data_s32 = new Int32Array(data, 0, Math.floor(data.byteLength/4));");
+  if (need_f32)
+    preamble.push("var data_f32 = new Float32Array(data, 0, Math.floor(data.byteLength/4));");
+  if (need_f64)
+    preamble.push("var data_f64 = new Float64Array(data, 0, Math.floor(data.byteLength/8));");
+
+  if (false) {
+    print("========== unmarshaller generated for: " + typeObject.__FullName__);
+    print(preamble.join('\n') + '\n' + body.join('\n'));
+    print("=================");
+  }
+
+  return JSIL.CreateNamedFunction(typeObject.__FullName__ + ".UnmarshalStruct",
+                                  ["target", "data", "offset"],
+                                  preamble.join('\n') + '\n' + body.join('\n'));
 };
 
 JSIL.DefaultValueInternal = function (typeObject, typePublicInterface) {
